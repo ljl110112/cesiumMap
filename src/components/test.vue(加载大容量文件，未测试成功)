@@ -1,0 +1,291 @@
+<template>
+  <div class="cesium-container">
+    <div id="cesium-container"></div>
+    <div v-if="loading" class="loading-overlay">
+      <div class="loading-progress">
+        加载进度: {{ progress }}%
+        <div class="progress-bar" :style="{ width: progress + '%' }"></div>
+      </div>
+    </div>
+    <div v-if="selectedInfo" class="info-card">
+      <button class="close-btn" @click="selectedInfo = null">×</button>
+      <pre>{{ selectedInfo }}</pre>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted, onUnmounted } from 'vue';
+
+// Cesium离线配置
+const CESIUM_BASE_URL = import.meta.env.BASE_URL + 'cesium/';
+window.CESIUM_BASE_URL = CESIUM_BASE_URL;
+
+// 状态管理
+const loading = ref(false);
+const progress = ref(0);
+const selectedInfo = ref(null);
+const viewerRef = ref(null);
+const workerRef = ref(null);
+
+// 动态加载Cesium
+const loadCesium = () => {
+  return new Promise((resolve) => {
+    const script = document.createElement('script');
+    script.src = CESIUM_BASE_URL + 'Cesium.js';
+    script.onload = () => {
+      Cesium.buildModuleUrl.setBaseUrl(CESIUM_BASE_URL);
+      Cesium.Ion.defaultAccessToken = ''; // 清空在线token
+      resolve();
+    };
+    document.head.appendChild(script);
+  });
+};
+
+// 初始化Viewer
+const initViewer = () => {
+  viewerRef.value = new Cesium.Viewer('cesium-container', {
+    terrainProvider: new Cesium.EllipsoidTerrainProvider(), // 离线地形
+    imageryProvider: new Cesium.TileMapServiceImageryProvider({
+      url: Cesium.buildModuleUrl('Assets/Textures/NaturalEarthII'),
+      fileExtension: 'jpg'
+    }),
+    timeline: false,
+    animation: false,
+    baseLayerPicker: false,
+    shouldAnimate: true
+  });
+
+  // 性能优化设置
+  viewerRef.value.scene.globe.depthTestAgainstTerrain = true;
+  viewerRef.value.scene.fog.enabled = false;
+
+  var wtMapModel = new Cesium.UrlTemplateImageryProvider({
+    url: "http://localhost:8888/oyzMap/wt/{z}/{x}/{reverseY}.png",
+    tilingScheme: new Cesium.WebMercatorTilingScheme(),  // 使用 Web Mercator 投影
+    customTags: {
+      reverseY: function (imageryProvider, x, y, level) {
+        // TMS 标准的 Y = (2^level - 1) - y
+        return (1 << level) - 1 - y;
+      }
+    },
+    minimumLevel: 0,
+    maximumLevel: 9,
+    fileExtension: 'png'
+  });
+  viewerRef.value.imageryLayers.addImageryProvider(wtMapModel);
+  viewerRef.value.camera.flyTo({
+    destination: Cesium.Cartesian3.fromDegrees(106.33, 29.34, 100000), // 设置相机位置
+    duration: 3 // 飞行时间
+  });
+};
+
+// 加载GeoJSON数据
+const loadGeoJSON = async (url) => {
+  try {
+    loading.value = true;
+    progress.value = 0;
+    
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('网络响应不正常');
+    
+    const geojson = await response.json();
+    if (!geojson?.features) throw new Error('无效的GeoJSON结构');
+    
+    processWithWorker(geojson);
+  } catch (error) {
+    console.error('加载GeoJSON失败:', error);
+    loading.value = false;
+  }
+};
+
+// Web Worker处理
+const processWithWorker = (geojson) => {
+  workerRef.value = new Worker(new URL('./geojson.worker.js', import.meta.url));
+  
+  workerRef.value.postMessage({ 
+    geojson,
+    batchSize: 2000,
+    simplifyTolerance: 0.0001
+  });
+  
+  workerRef.value.onmessage = (e) => {
+    if (e.data.done) {
+      loading.value = false;
+      workerRef.value.terminate();
+    } else {
+      progress.value = e.data.progress.toFixed(1);
+      scheduleBatchAdd(e.data.batch);
+    }
+  };
+};
+
+// 分批次渲染
+const scheduleBatchAdd = (batch) => {
+  console.log('开始处理批次，数量:', batch.length);
+  debugger;
+  
+  // 添加可视化标记
+  if (batch.length > 0) {
+    const firstPos = batch[0].geometry.coordinates[0];
+    viewerRef.value.entities.add({
+      point: {
+        position: Cesium.Cartesian3.fromDegrees(...firstPos),
+        pixelSize: 20,
+        color: Cesium.Color.RED
+      }
+    });
+  }
+  
+  const batchSizePerFrame = 100;
+  let index = 0;
+  
+  const addBatch = () => {
+    const startTime = performance.now();
+    while (index < batch.length && performance.now() - startTime < 16) {
+      const end = Math.min(index + batchSizePerFrame, batch.length);
+      for (; index < end; index++) {
+        addFeatureToCesium(batch[index]);
+      }
+    }
+    if (index < batch.length) requestAnimationFrame(addBatch);
+  };
+  requestAnimationFrame(addBatch);
+};
+
+// 添加要素到场景
+const addFeatureToCesium = (feature) => {
+  if (!viewerRef.value || !feature.geometry) return;
+
+  try {
+    const { geometry, properties } = feature;
+    
+    if (geometry.type === 'LineString' && geometry.coordinates?.length >= 2) {
+      const positions = Cesium.Cartesian3.fromDegreesArrayHeights(
+        geometry.coordinates.map(coord => 
+          coord.length === 2 ? [...coord, 0] : coord
+        ).flat()
+      );
+
+      const entity = viewerRef.value.entities.add({
+        polyline: {
+          positions: positions,
+          width: 3,
+          material: new Cesium.PolylineOutlineMaterialProperty({
+            color: Cesium.Color.YELLOW.withAlpha(0.8),
+            outlineWidth: 1,
+            outlineColor: Cesium.Color.BLACK
+          }),
+          clampToGround: true // 贴地显示
+        },
+        properties: properties || {}
+      });
+    }
+  } catch (error) {
+    console.warn('要素添加失败:', error, feature);
+  }
+};
+
+// 点击事件处理
+const setupClickHandler = () => {
+  if (!viewerRef.value) return;
+  
+  const handler = new Cesium.ScreenSpaceEventHandler(viewerRef.value.scene.canvas);
+  
+  handler.setInputAction((movement) => {
+    const picked = viewerRef.value.scene.pick(movement.position);
+    if (picked && picked.id?.properties) {
+      selectedInfo.value = formatProperties(picked.id.properties.getValue());
+    }
+  }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+};
+
+// 格式化属性显示
+const formatProperties = (props) => {
+  return Object.entries(props)
+    .filter(([key]) => !key.startsWith('_'))
+    .map(([key, val]) => `${key}: ${val}`)
+    .join('\n');
+};
+
+// 生命周期
+onMounted(async () => {
+  await loadCesium();
+  initViewer();
+  setupClickHandler();
+  loadGeoJSON('./data/roads.geojson'); // 修改为你的数据路径
+});
+
+onUnmounted(() => {
+  workerRef.value?.terminate();
+  viewerRef.value?.destroy();
+});
+</script>
+
+<style scoped>
+.cesium-container {
+  position: relative;
+  width: 100%;
+  height: 100vh;
+}
+
+.loading-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 999;
+}
+
+.loading-progress {
+  background: white;
+  padding: 20px;
+  border-radius: 5px;
+  min-width: 200px;
+  text-align: center;
+}
+
+.progress-bar {
+  height: 10px;
+  background-color: #4CAF50;
+  margin-top: 10px;
+  transition: width 0.3s;
+}
+
+.info-card {
+  position: absolute;
+  bottom: 20px;
+  left: 20px;
+  background: white;
+  padding: 15px;
+  border-radius: 5px;
+  max-width: 300px;
+  max-height: 200px;
+  overflow: auto;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+  z-index: 999;
+}
+
+.info-card pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-size: 12px;
+}
+
+.close-btn {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  background: none;
+  border: none;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 5px;
+}
+</style>
